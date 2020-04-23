@@ -1,0 +1,128 @@
+From f0b0dd64e045bf303e0c5d8bd40211930a6d7a85 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?C=C3=A9dric=20Le=20Goater?= <clg@kaod.org>
+Date: Mon, 27 Apr 2020 17:28:56 +0200
+Subject: [PATCH 2/2] ppc/spapr: Advertise StoreEOI for POWER10 compat guests
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When an interrupt has been handled, the OS notifies the interrupt
+controller with a EOI sequence. On a POWER9 and POWER10 systems using
+the XIVE interrupt controller, this can be done with a load or a store
+operation on the ESB interrupt management page of the interrupt. The
+StoreEOI operation has less latency and improves interrupt handling
+performance but it was deactivated during the POWER9 DD2.0 timeframe
+because of ordering issues. POWER9 systems use the LoadEOI instead.
+POWER10 compat guests should have fixed the issue with
+Load-after-Store ordering and StoreEOI can be activated for them
+again.
+
+To maintain performance, this ordering is only enforced for the
+XIVE_ESB_SET_PQ_10 load operation. This operation can be used to
+disable temporarily an interrupt source. If StoreEOI is active, a
+source could be left enabled if the load and store operations come
+out of order.
+
+Add a check in our XIVE emulation model for Load-after-Store when
+StoreEOI is active. It should catch unreliable sequences. Other load
+operationss should be fine without it.
+
+Signed-off-by: Cédric Le Goater <clg@kaod.org>
+---
+ include/hw/ppc/xive.h    |  8 ++++++++
+ hw/intc/spapr_xive_kvm.c | 15 +++++++++++++++
+ hw/intc/xive.c           |  6 ++++++
+ hw/ppc/spapr_hcall.c     | 15 +++++++++++++++
+ 4 files changed, 44 insertions(+)
+
+diff --git a/include/hw/ppc/xive.h b/include/hw/ppc/xive.h
+index 5086477ce29e..f8a363131656 100644
+--- a/include/hw/ppc/xive.h
++++ b/include/hw/ppc/xive.h
+@@ -279,6 +279,14 @@ uint8_t xive_esb_set(uint8_t *pq, uint8_t value);
+ #define XIVE_ESB_SET_PQ_10      0xe00 /* Load */
+ #define XIVE_ESB_SET_PQ_11      0xf00 /* Load */
+
++/*
++ * Load-after-store ordering
++ *
++ * Adding this offset to the load address will enforce
++ * load-after-store ordering. This is required to use with StoreEOI.
++ */
++#define XIVE_ESB_LD_ST_MO	0x40 /* Load-after-store ordering */
++
+ uint8_t xive_source_esb_get(XiveSource *xsrc, uint32_t srcno);
+ uint8_t xive_source_esb_set(XiveSource *xsrc, uint32_t srcno, uint8_t pq);
+
+diff --git a/hw/intc/spapr_xive_kvm.c b/hw/intc/spapr_xive_kvm.c
+index 43f4d56b958c..c7dd5e908e83 100644
+--- a/hw/intc/spapr_xive_kvm.c
++++ b/hw/intc/spapr_xive_kvm.c
+@@ -305,6 +305,21 @@ static uint64_t xive_esb_rw(XiveSource *xsrc, int srcno, uint32_t offset,
+
+ static uint8_t xive_esb_read(XiveSource *xsrc, int srcno, uint32_t offset)
+ {
++    /*
++     * The XIVE_ESB_SET_PQ_10 load operation is used to disable
++     * temporarily an interrupt source. If StoreEOI is active, a
++     * source could be left enabled if the load and store operations
++     * come out of order.
++     *
++     * As we don't know the characteristics of the host source
++     * interrupts (StoreEOI or not), enforce the load-after-store
++     * ordering always. The performance penalty will be very small for
++     * QEMU.
++     */
++    if (offset == XIVE_ESB_SET_PQ_10) {
++        offset |= XIVE_ESB_LD_ST_MO;
++    }
++
+     return xive_esb_rw(xsrc, srcno, offset, 0, 0) & 0x3;
+ }
+
+diff --git a/hw/intc/xive.c b/hw/intc/xive.c
+index b573a5a803bf..3f3382864a98 100644
+--- a/hw/intc/xive.c
++++ b/hw/intc/xive.c
+@@ -1035,6 +1035,12 @@ static uint64_t xive_source_esb_read(void *opaque, hwaddr addr, unsigned size)
+     case XIVE_ESB_SET_PQ_01 ... XIVE_ESB_SET_PQ_01 + 0x0FF:
+     case XIVE_ESB_SET_PQ_10 ... XIVE_ESB_SET_PQ_10 + 0x0FF:
+     case XIVE_ESB_SET_PQ_11 ... XIVE_ESB_SET_PQ_11 + 0x0FF:
++        if (offset == XIVE_ESB_SET_PQ_10 &&
++            xsrc->esb_flags & XIVE_SRC_STORE_EOI) {
++            qemu_log_mask(LOG_GUEST_ERROR, "XIVE: load-after-store ordering "
++                          "not enforced with Store EOI active for IRQ %d\n",
++                          srcno);
++        }
+         ret = xive_source_esb_set(xsrc, srcno, (offset >> 8) & 0x3);
+         break;
+     default:
+diff --git a/hw/ppc/spapr_hcall.c b/hw/ppc/spapr_hcall.c
+index 0f54988f2e28..09daee5715b5 100644
+--- a/hw/ppc/spapr_hcall.c
++++ b/hw/ppc/spapr_hcall.c
+@@ -1807,6 +1807,21 @@ target_ulong do_client_architecture_support(PowerPCCPU *cpu,
+ "Guest requested unavailable interrupt mode (XIVE), try the ic-mode=xive or ic-mode=dual machine property");
+             exit(EXIT_FAILURE);
+         }
++
++        /*
++         * Clear StoreEOI which could have been activated by a
++         * previous boot of a P10 compat guest.
++         */
++        spapr->xive->source.esb_flags &= ~XIVE_SRC_STORE_EOI;
++
++        /*
++         * Advertise StoreEOI for a P10 compat guest. OS is required
++         * to enforce load-after-store ordering.
++         */
++        if (ppc_check_compat(cpu, CPU_POWERPC_LOGICAL_3_10, 0,
++                             cpu->compat_pvr)) {
++            spapr->xive->source.esb_flags |= XIVE_SRC_STORE_EOI;
++        }
+     } else {
+         if (!spapr->irq->xics) {
+             error_report(
+--
+2.25.3
+
