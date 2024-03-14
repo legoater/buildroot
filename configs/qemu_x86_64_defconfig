@@ -11,6 +11,7 @@ BR2_TARGET_ROOTFS_CPIO=y
 BR2_TARGET_ROOTFS_CPIO_GZIP=y
 
 # Image
+BR2_ROOTFS_OVERLAY="board/qemu/x86_64/rootfs_overlay"
 BR2_ROOTFS_POST_BUILD_SCRIPT="board/qemu/x86_64/post-build.sh"
 
 # Image
